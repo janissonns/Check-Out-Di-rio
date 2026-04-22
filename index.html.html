@@ -393,6 +393,19 @@
 
 
 
+  <!-- Campo ID da planilha — visível só para o gestor dentro da área protegida por senha -->
+  <div style="background:#fff;border:1.5px solid var(--border);border-radius:var(--r);padding:13px 16px;margin-bottom:14px;box-shadow:var(--shadow-sm);display:flex;gap:10px;align-items:flex-start">
+    <i class="fa fa-table" style="color:var(--gold);flex-shrink:0;margin-top:3px"></i>
+    <div style="width:100%">
+      <div style="font-size:.74rem;font-weight:700;color:var(--ink2)">ID da Planilha Google Sheets</div>
+      <div style="font-size:.69rem;color:var(--muted);margin-top:2px">Cole o ID da planilha (entre /d/ e /edit na URL). Salvo neste dispositivo.</div>
+      <input type="text" id="sheet-id"
+        style="display:block;width:100%;margin-top:9px;border:1.5px solid var(--border);border-radius:10px;padding:8px 12px;font-family:'JetBrains Mono',monospace;font-size:.72rem;color:var(--ink);background:var(--surface-2)"
+        placeholder="Ex: 1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgVE2upms"
+        oninput="localStorage.setItem('sheet_id_gestor',this.value.trim())">
+    </div>
+  </div>
+
   <div class="consol-actions">
     <button class="btn-refresh" id="btn-refresh" onclick="carregarConsolidador()">
       <i class="fa fa-rotate-right" id="refresh-icon"></i> Atualizar dados
@@ -497,6 +510,11 @@ function getVal(id, tipo) {
 function scriptURL() {
   return document.getElementById('script-url').value.trim();
 }
+function sheetID() {
+  const el = document.getElementById('sheet-id');
+  if (el && el.value.trim()) return el.value.trim();
+  return localStorage.getItem('sheet_id_gestor') || '';
+}
 
 
 function hojeStr() {
@@ -535,6 +553,10 @@ function confirmarSenha() {
       document.getElementById('tab-'+t).classList.toggle('hidden', t !== 'consol');
       document.getElementById('tab-'+t+'-btn').classList.toggle('active', t === 'consol');
     });
+    // Restaura ID da planilha salvo neste dispositivo
+    const savedSid = localStorage.getItem('sheet_id_gestor') || '';
+    const sidEl = document.getElementById('sheet-id');
+    if (sidEl && savedSid) sidEl.value = savedSid;
     carregarConsolidador();
   } else {
     err.textContent = 'Senha incorreta. Tente novamente.';
@@ -758,77 +780,147 @@ function setStatus(state, txt) {
 
 function carregarConsolidador() {
   const url = scriptURL();
-  if (!url) {
-    setStatus('err', 'Cole a URL do Apps Script no campo acima.');
+  const sid = sheetID();
+
+  if (!url && !sid) {
+    setStatus('err', 'Configure a URL do Apps Script acima.');
     document.getElementById('gerente-cards').innerHTML =
-      '<p class="empty-msg">Configure a URL do Apps Script no campo acima.</p>';
+      '<p class="empty-msg" style="padding:20px">Configure a URL do Apps Script no campo acima.</p>';
     return;
   }
 
   document.getElementById('btn-refresh').classList.add('spinning');
   setStatus('loading', 'Buscando dados...');
 
-  const hoje   = hojeStr();
+  const hoje = hojeStr();
+
+  // Estratégia 1: Apps Script via JSONP (tempo real, sem cache)
+  if (url) {
+    _jsonpFetch(
+      url + '?action=GET_CONSOLIDADO&data=' + encodeURIComponent(hoje) + '&t=' + Date.now(),
+      function(resp) {
+        document.getElementById('btn-refresh').classList.remove('spinning');
+        if (resp && !resp.error && resp.dados) {
+          renderConsolidador(resp.dados);
+          const hora = new Date().toLocaleTimeString('pt-BR',{hour:'2-digit',minute:'2-digit'});
+          setStatus('', 'Atualizado às ' + hora + ' · ' + resp.dados.length + ' registro(s)');
+        } else {
+          // Estratégia 2: fallback para CSV se Apps Script falhar
+          if (sid) _csvFetch(sid, hoje);
+          else {
+            setStatus('err', 'Erro ao buscar dados. Verifique a URL do Apps Script.');
+            document.getElementById('gerente-cards').innerHTML =
+              '<p class="empty-msg" style="padding:20px">Erro ao conectar. Verifique a URL do Apps Script e se está publicado com acesso <strong>Qualquer pessoa</strong>.</p>';
+          }
+        }
+      },
+      function() {
+        // timeout — tenta CSV
+        if (sid) _csvFetch(sid, hoje);
+        else {
+          document.getElementById('btn-refresh').classList.remove('spinning');
+          setStatus('err', 'Timeout. Verifique a URL do Apps Script.');
+          document.getElementById('gerente-cards').innerHTML =
+            '<p class="empty-msg" style="padding:20px">⏱ Timeout. Verifique se o Apps Script está publicado com acesso <strong>Qualquer pessoa</strong>.</p>';
+        }
+      }
+    );
+    return;
+  }
+
+  // Apenas CSV (sem Apps Script configurado)
+  if (sid) _csvFetch(sid, hoje);
+}
+
+function _jsonpFetch(url, onSuccess, onTimeout) {
   const cbName = '__gs_' + Date.now();
   const tag    = document.createElement('script');
 
   const timer = setTimeout(() => {
-    limpaCb();
-    setStatus('err', 'Sem resposta. Republique o Apps Script com acesso: Qualquer pessoa.');
-    document.getElementById('gerente-cards').innerHTML =
-      '<p class="empty-msg" style="padding:20px;line-height:1.9">' +
-      '⏱ <strong>Timeout</strong><br><br>' +
-      'Verifique no Apps Script:<br>' +
-      '→ Implantar → Gerenciar implantações<br>' +
-      '→ Quem tem acesso: <strong>Qualquer pessoa</strong><br>' +
-      '→ Clique editar → Nova versão → Implantar</p>';
-    document.getElementById('btn-refresh').classList.remove('spinning');
-  }, 15000);
-
-  function limpaCb() {
-    clearTimeout(timer);
     delete window[cbName];
-    if (tag.parentNode) tag.parentNode.removeChild(tag);
-  }
+    tag.remove();
+    onTimeout();
+  }, 10000);
 
   window[cbName] = function(resp) {
-    limpaCb();
-    document.getElementById('btn-refresh').classList.remove('spinning');
-    if (resp && resp.error) {
-      setStatus('err', 'Erro: ' + resp.error);
-      document.getElementById('gerente-cards').innerHTML =
-        '<p class="empty-msg">Erro do servidor: ' + resp.error + '</p>';
-      return;
-    }
-    renderConsolidador(resp.dados || []);
-    const hora = new Date().toLocaleTimeString('pt-BR', {hour:'2-digit',minute:'2-digit'});
-    const n = (resp.dados||[]).length;
-    setStatus('', 'Atualizado às ' + hora + (n ? ' · ' + n + ' registro(s)' : ' · nenhum registro hoje'));
+    clearTimeout(timer);
+    delete window[cbName];
+    tag.remove();
+    onSuccess(resp);
   };
 
   tag.onerror = function() {
-    limpaCb();
-    document.getElementById('btn-refresh').classList.remove('spinning');
-    setStatus('err', 'Erro de rede. Verifique a URL.');
-    document.getElementById('gerente-cards').innerHTML =
-      '<p class="empty-msg">Erro de conexão com o Apps Script.</p>';
+    clearTimeout(timer);
+    delete window[cbName];
+    tag.remove();
+    onTimeout();
   };
 
-  // JSONP — única forma confiável com Apps Script sem servidor intermediário
-  tag.src = url
-    + '?action=GET_CONSOLIDADO'
-    + '&data=' + encodeURIComponent(hoje)
-    + '&callback=' + cbName
-    + '&t=' + Date.now();
+  tag.src = url + '&callback=' + cbName;
   document.head.appendChild(tag);
 }
 
+function _csvFetch(sid, hoje) {
+  // Cache-bust agressivo
+  const csvUrl = 'https://docs.google.com/spreadsheets/d/' + sid +
+    '/gviz/tq?tqx=out:csv&sheet=Checkouts&headers=1&t=' + Date.now() +
+    '&rand=' + Math.random();
+
+  fetch(csvUrl, { cache: 'no-store' })
+    .then(r => { if (!r.ok) throw new Error('HTTP '+r.status); return r.text(); })
+    .then(csv => {
+      const dados = parseCSV(csv, hoje);
+      renderConsolidador(dados);
+      const hora = new Date().toLocaleTimeString('pt-BR',{hour:'2-digit',minute:'2-digit'});
+      setStatus('', 'Atualizado às ' + hora + ' (via planilha) · ' + dados.length + ' registro(s)');
+    })
+    .catch(() => {
+      setStatus('err', 'Erro ao ler planilha. Publique: Arquivo → Publicar na web → CSV.');
+      document.getElementById('gerente-cards').innerHTML =
+        '<p class="empty-msg" style="padding:20px;line-height:1.9">' +
+        '❌ Não foi possível ler a planilha.<br><br>' +
+        '<strong>Verifique:</strong><br>' +
+        '1. ID da planilha está correto<br>' +
+        '2. Publique: <strong>Arquivo → Publicar na web → Checkouts → CSV</strong></p>';
+    })
+    .finally(() => {
+      document.getElementById('btn-refresh').classList.remove('spinning');
+    });
+}
 
 
-/* ════════════════════════════════════════════
-   🖥️  RENDER CONSOLIDADOR
-   json.dados = array de objetos (uma linha por gerente)
-════════════════════════════════════════════ */
+function parseCSV(csv, hoje) {
+  if (!csv || !csv.trim()) return [];
+  const lines = csv.trim().split('\n');
+  if (lines.length < 2) return [];
+
+  function splitLine(line) {
+    const cols = []; let cur = '', inQ = false;
+    for (let i = 0; i < line.length; i++) {
+      const c = line[i];
+      if (c === '"' && !inQ)  { inQ = true; continue; }
+      if (c === '"' && inQ)   { if (line[i+1] === '"') { cur += '"'; i++; } else inQ = false; continue; }
+      if (c === ',' && !inQ)  { cols.push(cur); cur = ''; continue; }
+      cur += c;
+    }
+    cols.push(cur);
+    return cols;
+  }
+
+  const headers  = splitLine(lines[0]);
+  const dataIdx  = headers.indexOf('data');
+
+  return lines.slice(1)
+    .map(l => {
+      const vals = splitLine(l);
+      const obj  = {};
+      headers.forEach((h, i) => { obj[h] = (vals[i] || '').trim(); });
+      return obj;
+    })
+    .filter(row => String(row['data'] || '').trim() === hoje);
+}
+
+
 function renderConsolidador(linhas) {
   // Agrupar por gerente (pega o último envio de cada um no dia)
   const dadosPorGerente = {};
@@ -990,3 +1082,4 @@ init();
 </script>
 </body>
 </html>
+
